@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -27,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
@@ -44,9 +46,11 @@ import (
 	promlogflag "github.com/prometheus/common/promlog/flag"
 
 	api_v1 "github.com/prometheus/pushgateway/api/v1"
-	"github.com/prometheus/pushgateway/asset"
+	"github.com/prometheus/pushgateway/cgroup/parser"
 	"github.com/prometheus/pushgateway/handler"
+	"github.com/prometheus/pushgateway/internal/monitor"
 	"github.com/prometheus/pushgateway/storage"
+	"toolman.org/net/peercred"
 )
 
 func init() {
@@ -67,12 +71,13 @@ func main() {
 		metricsPath         = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
 		externalURL         = app.Flag("web.external-url", "The URL under which the Pushgateway is externally reachable.").Default("").URL()
 		routePrefix         = app.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to the path of --web.external-url.").Default("").String()
-		enableLifeCycle     = app.Flag("web.enable-lifecycle", "Enable shutdown via HTTP request.").Default("false").Bool()
 		enableAdminAPI      = app.Flag("web.enable-admin-api", "Enable API endpoints for admin control actions.").Default("false").Bool()
 		persistenceFile     = app.Flag("persistence.file", "File to persist metrics. If empty, metrics are only kept in memory.").Default("").String()
 		persistenceInterval = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
-		pushUnchecked       = app.Flag("push.disable-consistency-check", "Do not check consistency of pushed metrics. DANGEROUS.").Default("false").Bool()
 		promlogConfig       = promlog.Config{}
+		socketPath          = app.Flag("socket.path", "Socket path for communication.").Default("/tmp/pushgateway/socket").String()
+		trustedPath         = app.Flag("trust.path", "Multiple trusted apptainer starter paths, use ';' to separate multiple entries").Default("").String()
+		monitorInterval     = app.Flag("monitor.inverval", "The internval for sending system status.").Default("0.5s").Duration()
 	)
 	promlogflag.AddFlags(app, &promlogConfig)
 	app.Version(version.Print("pushgateway"))
@@ -107,62 +112,54 @@ func main() {
 		prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) { return ms.GetMetricFamilies(), nil }),
 	}
 
+	// server error channel
+	errCh := make(chan error, 2)
+
+	// verification server route
 	r := route.New()
-	r.Get(*routePrefix+"/-/healthy", handler.Healthy(ms).ServeHTTP)
-	r.Get(*routePrefix+"/-/ready", handler.Ready(ms).ServeHTTP)
-	r.Get(
+	mux := http.NewServeMux()
+	mux.Handle("/", decodeRequest(r))
+	verifyServer := &http.Server{Handler: mux}
+
+	// create necessary parent folder for socket path
+	parentFolder := path.Dir(*socketPath)
+	if _, err := os.Stat(parentFolder); os.IsNotExist(err) {
+		err := os.MkdirAll(parentFolder, 0o755)
+		if err != nil {
+			level.Error(logger).Log("msg", "Failed to create parent folder", "err", err)
+		}
+	}
+
+	verificationOption := &serverOption{
+		server:      verifyServer,
+		webConfig:   webConfig,
+		ms:          ms,
+		logger:      logger,
+		socketPath:  *socketPath,
+		trustedPath: *trustedPath,
+		interval:    time.NewTicker(*monitorInterval),
+		errCh:       errCh,
+	}
+	go startVerificationServer(verificationOption)
+
+	// metrics server
+	metricsRoute := route.New()
+	metricsRoute.Get(
 		path.Join(*routePrefix, *metricsPath),
 		promhttp.HandlerFor(g, promhttp.HandlerOpts{
 			ErrorLog: logFunc(level.Error(logger).Log),
 		}).ServeHTTP,
 	)
-
-	// Handlers for pushing and deleting metrics.
-	pushAPIPath := *routePrefix + "/metrics"
-	for _, suffix := range []string{"", handler.Base64Suffix} {
-		jobBase64Encoded := suffix == handler.Base64Suffix
-		r.Put(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Push(ms, true, !*pushUnchecked, jobBase64Encoded, logger))
-		r.Post(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Push(ms, false, !*pushUnchecked, jobBase64Encoded, logger))
-		r.Del(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Delete(ms, jobBase64Encoded, logger))
-		r.Put(pushAPIPath+"/job"+suffix+"/:job", handler.Push(ms, true, !*pushUnchecked, jobBase64Encoded, logger))
-		r.Post(pushAPIPath+"/job"+suffix+"/:job", handler.Push(ms, false, !*pushUnchecked, jobBase64Encoded, logger))
-		r.Del(pushAPIPath+"/job"+suffix+"/:job", handler.Delete(ms, jobBase64Encoded, logger))
-	}
-	r.Get(*routePrefix+"/static/*filepath", handler.Static(asset.Assets, *routePrefix).ServeHTTP)
-
-	statusHandler := handler.Status(ms, asset.Assets, flags, externalPathPrefix, logger)
-	r.Get(*routePrefix+"/status", statusHandler.ServeHTTP)
-	r.Get(*routePrefix+"/", statusHandler.ServeHTTP)
-
-	// Re-enable pprof.
-	r.Get(*routePrefix+"/debug/pprof/*pprof", handlePprof)
-
-	quitCh := make(chan struct{})
-	quitHandler := func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Requesting termination... Goodbye!")
-		close(quitCh)
-	}
-
-	forbiddenAPINotEnabled := func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte("Lifecycle API is not enabled."))
-	}
-
-	if *enableLifeCycle {
-		r.Put(*routePrefix+"/-/quit", quitHandler)
-		r.Post(*routePrefix+"/-/quit", quitHandler)
-	} else {
-		r.Put(*routePrefix+"/-/quit", forbiddenAPINotEnabled)
-		r.Post(*routePrefix+"/-/quit", forbiddenAPINotEnabled)
-	}
-
-	r.Get("/-/quit", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte("Only POST or PUT requests allowed."))
-	})
-
-	mux := http.NewServeMux()
-	mux.Handle("/", decodeRequest(r))
+	metricsRoute.Get(
+		*routePrefix+"/healthy",
+		handler.Healthy(ms).ServeHTTP,
+	)
+	metricsRoute.Get(
+		*routePrefix+"/ready",
+		handler.Ready(ms).ServeHTTP,
+	)
+	metricMux := http.NewServeMux()
+	metricMux.Handle("/", decodeRequest(metricsRoute))
 
 	buildInfo := map[string]string{
 		"version":   version.Version,
@@ -186,22 +183,21 @@ func main() {
 		av1.Put("/admin/wipe", handler.WipeMetricStore(ms, logger).ServeHTTP)
 	}
 
-	mux.Handle(apiPath+"/v1/", http.StripPrefix(apiPath+"/v1", av1))
+	metricMux.Handle(apiPath+"/v1/", http.StripPrefix(apiPath+"/v1", av1))
+	metricServer := &http.Server{Handler: metricMux}
 
-	server := &http.Server{Handler: mux}
-
-	go shutdownServerOnQuit(server, quitCh, logger)
-	err := web.ListenAndServe(server, webConfig, logger)
-
-	// In the case of a graceful shutdown, do not log the error.
-	if err == http.ErrServerClosed {
-		level.Info(logger).Log("msg", "HTTP server stopped")
-	} else {
-		level.Error(logger).Log("msg", "HTTP server stopped", "err", err)
+	metricOption := &serverOption{
+		server:    metricServer,
+		webConfig: webConfig,
+		ms:        ms,
+		logger:    logger,
+		errCh:     errCh,
 	}
+	go startMetricsServer(metricOption)
 
-	if err := ms.Shutdown(); err != nil {
-		level.Error(logger).Log("msg", "problem shutting down metric storage", "err", err)
+	err := shutdownServerOnQuit(*socketPath, []*serverOption{verificationOption, metricOption}, ms, errCh, logger)
+	if err != nil {
+		level.Error(logger).Log("msg", "Failed to clean up the server", "err", err)
 	}
 }
 
@@ -263,7 +259,7 @@ func computeRoutePrefix(prefix string, externalURL *url.URL) string {
 
 // shutdownServerOnQuit shutdowns the provided server upon closing the provided
 // quitCh or upon receiving a SIGINT or SIGTERM.
-func shutdownServerOnQuit(server *http.Server, quitCh <-chan struct{}, logger log.Logger) error {
+func shutdownServerOnQuit(socketPath string, options []*serverOption, ms *storage.DiskMetricStore, errCh <-chan error, logger log.Logger) error {
 	notifier := make(chan os.Signal, 1)
 	signal.Notify(notifier, os.Interrupt, syscall.SIGTERM)
 
@@ -271,9 +267,182 @@ func shutdownServerOnQuit(server *http.Server, quitCh <-chan struct{}, logger lo
 	case <-notifier:
 		level.Info(logger).Log("msg", "received SIGINT/SIGTERM; exiting gracefully...")
 		break
-	case <-quitCh:
-		level.Warn(logger).Log("msg", "received termination request via web service, exiting gracefully...")
+	case err := <-errCh:
+		level.Warn(logger).Log("msg", "received error when launching server, exiting gracefully...", "err", err)
 		break
 	}
-	return server.Shutdown(context.Background())
+
+	defer os.Remove(socketPath)
+
+	var retErr error
+	for _, option := range options {
+		err := option.server.Shutdown(context.Background())
+		if err != nil {
+			level.Error(logger).Log("msg", "unable to shutdown the server", "err", err)
+			retErr = fmt.Errorf("%w %w", retErr, err)
+		}
+	}
+
+	err := ms.Shutdown()
+	if err != nil {
+		level.Error(logger).Log("msg", "unable to shutdown the storage service", "err", err)
+		retErr = fmt.Errorf("%w %w", retErr, err)
+	}
+	return retErr
+}
+
+type serverOption struct {
+	server      *http.Server
+	webConfig   *web.FlagConfig
+	ms          storage.MetricStore
+	logger      log.Logger
+	socketPath  string
+	trustedPath string
+	interval    *time.Ticker
+	errCh       chan error
+}
+
+func startVerificationServer(option *serverOption) {
+	level.Info(option.logger).Log("msg", "Start verification server")
+	unixListener, err := peercred.Listen(context.Background(), option.socketPath)
+	if err != nil {
+		level.Error(option.logger).Log("msg", "Could not create local unix socket", "err", err)
+		option.errCh <- err
+		return
+	}
+
+	// chmod socketPath
+	err = os.Chmod(option.socketPath, 0o777)
+	if err != nil {
+		level.Error(option.logger).Log("msg", "Could not chmod local unix socket", "err", err)
+		option.errCh <- err
+		return
+	}
+
+	listener := wrappedListener{
+		Listener:     unixListener,
+		trustedPath:  option.trustedPath,
+		option:       option,
+		containerMap: make(map[string]*containerInfo),
+	}
+
+	quitCh := make(chan struct{}, 1)
+
+	go func() {
+		err = web.Serve(&listener, option.server, option.webConfig, option.logger)
+		if err != nil {
+			if err == http.ErrServerClosed {
+				level.Info(option.logger).Log("msg", "Verification server stopped")
+			} else {
+				level.Error(option.logger).Log("msg", "Verification server stopped with error", "err", err)
+				option.errCh <- err
+			}
+		}
+
+		quitCh <- struct{}{}
+	}()
+
+	for {
+		for id, info := range listener.containerMap {
+			select {
+			case <-quitCh:
+				// stop all loop
+				return
+			case err := <-info.ErrCh:
+				level.Error(option.logger).Log("msg", "Container monitor instance receieved error", "container id", id, "err", err)
+				// server side closes the connection in case client side misses (in theory client will close the connection first)
+				if info.Conn != nil {
+					info.Conn.Close()
+				}
+			case <-info.Done:
+				level.Info(option.logger).Log("msg", "Container monitor instance completed, will close the connection", "container id", id)
+				// server side closes the connection in case client side misses (in theory client will close the connection first)
+				if info.Conn != nil {
+					info.Conn.Close()
+				}
+			case <-time.NewTicker(time.Millisecond * 10).C:
+				// check next monitor instance
+			}
+		}
+	}
+}
+
+func startMetricsServer(option *serverOption) {
+	level.Info(option.logger).Log("msg", "Start metrics server")
+	err := web.ListenAndServe(option.server, option.webConfig, option.logger)
+	if err != nil {
+		if err == http.ErrServerClosed {
+			level.Info(option.logger).Log("msg", "Metrics server stopped")
+		} else {
+			level.Error(option.logger).Log("msg", "Metrics server stopped", "err", err)
+			option.errCh <- err
+		}
+	}
+}
+
+type containerInfo struct {
+	*parser.ContainerInfo
+	*monitor.MonitorInstance
+	net.Conn
+}
+
+type wrappedListener struct {
+	*peercred.Listener
+	trustedPath  string
+	option       *serverOption
+	containerMap map[string]*containerInfo
+}
+
+func (l *wrappedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	pid := conn.(*peercred.Conn).Ucred.Pid
+
+	// verification by pid
+	link, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return nil, err
+	}
+
+	exe := filepath.Base(link)
+	verify := false
+	for _, path := range strings.Split(l.trustedPath, ";") {
+		if strings.TrimSpace(link) == strings.TrimSpace(path) {
+			verify = true
+		}
+	}
+
+	if !verify {
+		if conn != nil {
+			conn.Close()
+		}
+		level.Error(l.option.logger).Log("msg", fmt.Sprintf("%s is not trusted, connection rejected", link))
+		return conn, nil
+	}
+
+	// container and monitor instance info
+	container := &parser.ContainerInfo{
+		FullPath: link,
+		Pid:      uint64(pid),
+		Exe:      exe,
+		Id:       fmt.Sprintf("%s_%d", exe, pid),
+	}
+	instance := monitor.New(l.option.interval)
+
+	// save the container info for further usage
+	l.containerMap[container.Id] = &containerInfo{
+		ContainerInfo:   container,
+		MonitorInstance: instance,
+		Conn:            conn,
+	}
+
+	// fire monitor thread
+	go instance.Start(container, l.option.ms, l.option.logger)
+
+	level.Info(l.option.logger).Log("msg", "New connection established", "container id", container.Id, "container pid", container.Pid, "container full path", container.FullPath)
+
+	return conn, nil
 }
