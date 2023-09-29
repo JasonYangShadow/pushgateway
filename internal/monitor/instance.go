@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright (c) 2023, CIQ, Inc. All rights reserved
+// SPDX-License-Identifier: Apache-2.0
 package monitor
 
 import (
@@ -7,8 +9,8 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/prometheus/pushgateway/cgroup"
-	"github.com/prometheus/pushgateway/cgroup/parser"
+	"github.com/prometheus/pushgateway/internal/cgroup"
+	"github.com/prometheus/pushgateway/internal/cgroup/parser"
 	"github.com/prometheus/pushgateway/internal/push"
 	"github.com/prometheus/pushgateway/storage"
 )

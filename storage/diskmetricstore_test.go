@@ -1,3 +1,5 @@
+//nolint:goheader
+
 // Copyright 2014 The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1190,7 +1192,6 @@ func TestSanitizeLabels(t *testing.T) {
 	); err != nil {
 		t.Error(err)
 	}
-
 }
 
 func TestReplace(t *testing.T) {
@@ -1466,7 +1467,6 @@ func TestHelpStringFix(t *testing.T) {
 	if err := dms.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
-
 }
 
 func TestGroupingKeyForLabels(t *testing.T) {
