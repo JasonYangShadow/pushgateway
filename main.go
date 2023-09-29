@@ -19,6 +19,7 @@ package main
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -244,14 +245,14 @@ func shutdownServerOnQuit(socketPath string, options []*network.ServerOption, ms
 		err := option.Server.Shutdown(context.Background())
 		if err != nil {
 			level.Error(logger).Log("msg", "unable to shutdown the server", "err", err)
-			retErr = fmt.Errorf("%w %w", retErr, err)
+			retErr = errors.Join(retErr, err)
 		}
 	}
 
 	err := ms.Shutdown()
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to shutdown the storage service", "err", err)
-		retErr = fmt.Errorf("%w %w", retErr, err)
+		retErr = errors.Join(retErr, err)
 	}
 	return retErr
 }
