@@ -1,0 +1,45 @@
+@startuml apptainer
+participant Apptainer
+participant Pushgateway
+participant Cgroup
+
+== Pushgateway Initialization ==
+    activate Pushgateway #Red
+    Pushgateway -> Pushgateway: Socket creation & Metrics endpoints expose
+
+== Apptainer Container Creation ==
+
+    activate Apptainer #Green
+    Apptainer -> Pushgateway: SO_PEERCRED verification request via socket
+    Pushgateway -> Pushgateway: Retrieve the caller PID info \nand verifies caller info against\n --trust.path
+
+    alt #Pink Failure
+        Pushgateway ->x Apptainer: Connection refused
+    else #Cyan Success
+        Pushgateway -> Apptainer: Connection established
+        Apptainer -> Apptainer: Save the socket connection
+
+        Group Cgroup manipulation
+            Pushgateway -> Cgroup: Create sub-group under \nmetric-gateway group
+            Pushgateway -> Cgroup: Request to move caller process \ninto the newly created sub-group
+            note left: the caller \nactually is \nstarter (starter-suid)
+            Pushgateway -> Pushgateway: Launch a monitor goroutine
+            loop every 500ms (configurable)
+                Pushgateway -> Cgroup: Check whether there are any processes running
+                Pushgateway <- Cgroup: PIDs data
+                Pushgateway -> Pushgateway: If no processes are live, monitor routine \nwill exit (close the socket connection)
+                Pushgateway -> Cgroup: Retrieve sub-group stats
+                Pushgateway <- Cgroup: Stats data
+                Pushgateway -> Pushgateway: Push metrics into storage
+            end
+        end
+    end
+
+
+== Apptainer Container Cleanup ==
+
+    Apptainer -> Apptainer: Close the saved socket connection
+    deactivate Apptainer
+
+    deactivate Pushgateway
+@enduml
