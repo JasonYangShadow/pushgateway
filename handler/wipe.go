@@ -1,3 +1,5 @@
+//nolint:goheader
+
 // Copyright 2019 The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,8 +30,8 @@ import (
 // The returned handler is already instrumented for Prometheus.
 func WipeMetricStore(
 	ms storage.MetricStore,
-	logger log.Logger) http.Handler {
-
+	logger log.Logger,
+) http.Handler {
 	return InstrumentWithCounter(
 		"wipe",
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -42,6 +44,5 @@ func WipeMetricStore(
 					Timestamp: time.Now(),
 				})
 			}
-
 		}))
 }

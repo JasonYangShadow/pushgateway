@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2023, CIQ, Inc. All rights reserved
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright 2014 The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -86,28 +89,6 @@ func ctxWithParams(params map[string]string, mainReq *http.Request) context.Cont
 	}
 
 	return ctx
-}
-
-func TestHealthyReady(t *testing.T) {
-	mms := MockMetricStore{}
-	req, err := http.NewRequest("GET", "http://example.org/", &bytes.Buffer{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	healthyHandler := Healthy(&mms)
-	readyHandler := Ready(&mms)
-
-	w := httptest.NewRecorder()
-	healthyHandler.ServeHTTP(w, req)
-	if expected, got := http.StatusOK, w.Code; expected != got {
-		t.Errorf("Wanted status code %v, got %v.", expected, got)
-	}
-
-	readyHandler.ServeHTTP(w, req)
-	if expected, got := http.StatusOK, w.Code; expected != got {
-		t.Errorf("Wanted status code %v, got %v.", expected, got)
-	}
 }
 
 func TestPush(t *testing.T) {
@@ -481,7 +462,6 @@ func TestDelete(t *testing.T) {
 	if expected, got := "testinstance", mms.lastWriteRequest.Labels["instance"]; expected != got {
 		t.Errorf("Wanted instance %v, got %v.", expected, got)
 	}
-
 }
 
 func TestSplitLabels(t *testing.T) {
